@@ -6,6 +6,7 @@ package timewheel
 import (
 	"container/list"
 	"my-redis/lib/logger"
+	"runtime"
 	"sync"
 	"time"
 )
@@ -28,6 +29,9 @@ type TimeWheel struct {
 	addTaskChannel    chan task   // 添加任务通道（线程安全）
 	removeTaskChannel chan string // 删除任务通道
 	stopChannel       chan bool   // 停止信号通道
+
+	jobChannel  chan func() // worker pool 任务队列（固定大小，反压用）
+	workerCount int         // worker 数量
 
 	mu sync.RWMutex // 保护链表扫描
 }
@@ -53,6 +57,8 @@ func New(interval time.Duration, slotNum int) *TimeWheel {
 		addTaskChannel:    make(chan task),
 		removeTaskChannel: make(chan string),
 		stopChannel:       make(chan bool),
+		jobChannel:        make(chan func(), 4096),
+		workerCount:       runtime.NumCPU(),
 	}
 	tw.initSlots()
 	return tw
@@ -67,6 +73,9 @@ func (tw *TimeWheel) initSlots() {
 // Start starts the time wheel
 func (tw *TimeWheel) Start() {
 	tw.ticker = time.NewTicker(tw.interval)
+	for i := 0; i < tw.workerCount; i++ {
+		go tw.runWorker()
+	}
 	go tw.start()
 }
 
@@ -103,8 +112,22 @@ func (tw *TimeWheel) start() {
 			tw.removeTask(key)
 		case <-tw.stopChannel:
 			tw.ticker.Stop()
+			close(tw.jobChannel)
 			return
 		}
+	}
+}
+
+func (tw *TimeWheel) runWorker() {
+	for job := range tw.jobChannel {
+		func() {
+			defer func() {
+				if err := recover(); err != nil {
+					logger.Error(err)
+				}
+			}()
+			job()
+		}()
 	}
 }
 
@@ -118,12 +141,14 @@ func (tw *TimeWheel) tickHandler() {
 	}
 	tw.mu.Unlock()
 
-	go tw.scanAndRunTask(l)
+	tw.scanAndRunTask(l)
 }
 
 func (tw *TimeWheel) scanAndRunTask(l *list.List) {
 	var tasksToRemove []string
-	tw.mu.RLock() // Read lock for accessing the list
+	var jobs []func()
+
+	tw.mu.RLock()
 	for e := l.Front(); e != nil; {
 		task := e.Value.(*task)
 		if task.circle > 0 {
@@ -132,30 +157,28 @@ func (tw *TimeWheel) scanAndRunTask(l *list.List) {
 			continue
 		}
 
-		go func(job func()) {
-			defer func() {
-				if err := recover(); err != nil {
-					logger.Error(err)
-				}
-			}()
-			job()
-		}(task.job)
+		jobs = append(jobs, task.job)
 
 		if task.key != "" {
 			tasksToRemove = append(tasksToRemove, task.key)
 		}
 		next := e.Next()
-		l.Remove(e) // Safe as this is a local operation
+		l.Remove(e)
 		e = next
 	}
 	tw.mu.RUnlock()
 
-	// Remove tasks from the timer after the scan
+	// 清理 timer 映射（持写锁）
 	tw.mu.Lock()
 	for _, key := range tasksToRemove {
 		delete(tw.timer, key)
 	}
 	tw.mu.Unlock()
+
+	// 提交到 worker pool（不持锁，阻塞 = 反压）
+	for _, job := range jobs {
+		tw.jobChannel <- job
+	}
 }
 
 func (tw *TimeWheel) addTask(task *task) {
