@@ -1,28 +1,94 @@
 package protocol
 
-// RESP协议常量
-const (
-	// 换行符
-	CRLF = "\r\n"
-
-	// 类型标识
-	SIMPLE_STRING = '+'  // 简单字符串
-	ERROR         = '-'  // 错误
-	INTEGER       = ':'  // 整数
-	BULK_STRING   = '$'  // 批量字符串
-	ARRAY         = '*' // 多批量字符串
-
-	// 空值
-	NULL          = "$-1\r\n"       // 空批量字符串
-	NULL_ARRAY    = "*-1\r\n"      // 空数组
-	EMPTY_STRING  = "$0\r\n\r\n"   // 空字符串
+import (
+	"bytes"
+	"my-redis/interfaces/redis"
 )
 
-// 常用回复
-var (
-	OK_REPLY      = "+OK\r\n"
-	PONG_REPLY    = "+PONG\r\n"
-	QUEUED_REPLY  = "+QUEUED\r\n"
-	NULL_REPLY    = "$-1\r\n"
-	EMPTY_REPLY   = "*0\r\n"
-)
+// PongReply is +PONG
+type PongReply struct{}
+
+var pongBytes = []byte("+PONG\r\n")
+
+// ToBytes marshal redis.Reply
+func (r *PongReply) ToBytes() []byte {
+	return pongBytes
+}
+
+// OkReply is +OK
+type OkReply struct{}
+
+var okBytes = []byte("+OK\r\n")
+
+// ToBytes marshal redis.Reply
+func (r *OkReply) ToBytes() []byte {
+	return okBytes
+}
+
+var theOkReply = new(OkReply)
+
+// MakeOkReply returns a ok protocol
+func MakeOkReply() *OkReply {
+	return theOkReply
+}
+
+var nullBulkBytes = []byte("$-1\r\n")
+
+// NullBulkReply is empty string
+type NullBulkReply struct{}
+
+// ToBytes marshal redis.Reply
+func (r *NullBulkReply) ToBytes() []byte {
+	return nullBulkBytes
+}
+
+// MakeNullBulkReply creates a new NullBulkReply
+func MakeNullBulkReply() *NullBulkReply {
+	return &NullBulkReply{}
+}
+
+var emptyMultiBulkBytes = []byte("*0\r\n")
+
+// EmptyMultiBulkReply is a empty list
+type EmptyMultiBulkReply struct{}
+
+// ToBytes marshal redis.Reply
+func (r *EmptyMultiBulkReply) ToBytes() []byte {
+	return emptyMultiBulkBytes
+}
+
+// MakeEmptyMultiBulkReply creates EmptyMultiBulkReply
+func MakeEmptyMultiBulkReply() *EmptyMultiBulkReply {
+	return &EmptyMultiBulkReply{}
+}
+
+func IsEmptyMultiBulkReply(reply redis.Reply) bool {
+	return bytes.Equal(reply.ToBytes(), emptyMultiBulkBytes)
+}
+
+// NoReply respond nothing, for commands like subscribe
+type NoReply struct{}
+
+var noBytes = []byte("")
+
+// ToBytes marshal redis.Reply
+func (r *NoReply) ToBytes() []byte {
+	return noBytes
+}
+
+// QueuedReply is +QUEUED
+type QueuedReply struct{}
+
+var queuedBytes = []byte("+QUEUED\r\n")
+
+// ToBytes marshal redis.Reply
+func (r *QueuedReply) ToBytes() []byte {
+	return queuedBytes
+}
+
+var theQueuedReply = new(QueuedReply)
+
+// MakeQueuedReply returns a QUEUED protocol
+func MakeQueuedReply() *QueuedReply {
+	return theQueuedReply
+}

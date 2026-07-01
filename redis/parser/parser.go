@@ -1,199 +1,228 @@
-package protocol
+package parser
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
+	"io"
+	"runtime/debug"
 	"strconv"
+	"strings"
 
 	"my-redis/interfaces/redis"
+	"my-redis/lib/logger"
+	"my-redis/redis/protocol"
 )
 
-var (
-
-	// CRLF is the line separator of redis serialization protocol
-	CRLF = "\r\n"
-)
-
-/* ---- Bulk Reply ---- */
-
-// BulkReply stores a binary-safe string
-type BulkReply struct {
-	Arg []byte
+// Payload stores redis.Reply or error
+type Payload struct {
+	Data redis.Reply
+	Err  error
 }
 
-// MakeBulkReply creates  BulkReply
-func MakeBulkReply(arg []byte) *BulkReply {
-	return &BulkReply{
-		Arg: arg,
+// ParseStream reads data from io.Reader and send payloads through channel
+func ParseStream(reader io.Reader) <-chan *Payload {
+	ch := make(chan *Payload)
+	go parse0(reader, ch)
+	return ch
+}
+
+// ParseBytes reads data from []byte and return all replies
+func ParseBytes(data []byte) ([]redis.Reply, error) {
+	ch := make(chan *Payload)
+	reader := bytes.NewReader(data)
+	go parse0(reader, ch)
+	var results []redis.Reply
+	for payload := range ch {
+		if payload == nil {
+			return nil, errors.New("no protocol")
+		}
+		if payload.Err != nil {
+			if payload.Err == io.EOF {
+				break
+			}
+			return nil, payload.Err
+		}
+		results = append(results, payload.Data)
 	}
+	return results, nil
 }
 
-// ToBytes marshal redis.Reply
-func (r *BulkReply) ToBytes() []byte {
-	if r.Arg == nil {
-		return nullBulkBytes
+// ParseOne reads data from []byte and return the first payload
+func ParseOne(data []byte) (redis.Reply, error) {
+	ch := make(chan *Payload, 1)
+	reader := bytes.NewReader(data)
+	go parse0(reader, ch)
+	payload := <-ch // parse0 will close the channel
+	if payload == nil {
+		return nil, errors.New("no protocol")
 	}
-	return []byte("$" + strconv.Itoa(len(r.Arg)) + CRLF + string(r.Arg) + CRLF)
+	return payload.Data, payload.Err
 }
 
-/* ---- Multi Bulk Reply ---- */
-
-// MultiBulkReply stores a list of string
-type MultiBulkReply struct {
-	Args [][]byte
-}
-
-// MakeMultiBulkReply creates MultiBulkReply
-func MakeMultiBulkReply(args [][]byte) *MultiBulkReply {
-	return &MultiBulkReply{
-		Args: args,
-	}
-}
-
-// ToBytes marshal redis.Reply
-func (r *MultiBulkReply) ToBytes() []byte {
-	var buf bytes.Buffer
-	//Calculate the length of buffer
-	argLen := len(r.Args)
-	bufLen := 1 + len(strconv.Itoa(argLen)) + 2
-	for _, arg := range r.Args {
-		if arg == nil {
-			bufLen += 3 + 2
-		} else {
-			bufLen += 1 + len(strconv.Itoa(len(arg))) + 2 + len(arg) + 2
+func parse0(rawReader io.Reader, ch chan<- *Payload) {
+	defer func() {
+		if err := recover(); err != nil {
+			logger.Error(err, string(debug.Stack()))
+		}
+	}()
+	reader := bufio.NewReader(rawReader)
+	for {
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			ch <- &Payload{Err: err}
+			close(ch)
+			return
+		}
+		length := len(line)
+		if length <= 2 || line[length-2] != '\r' {
+			// there are some empty lines within replication traffic, ignore this error
+			//protocolError(ch, "empty line")
+			continue
+		}
+		line = bytes.TrimSuffix(line, []byte{'\r', '\n'})
+		switch line[0] {
+		case '+':
+			content := string(line[1:])
+			ch <- &Payload{
+				Data: protocol.MakeStatusReply(content),
+			}
+			if strings.HasPrefix(content, "FULLRESYNC") {
+				err = parseRDBBulkString(reader, ch)
+				if err != nil {
+					ch <- &Payload{Err: err}
+					close(ch)
+					return
+				}
+			}
+		case '-':
+			ch <- &Payload{
+				Data: protocol.MakeErrReply(string(line[1:])),
+			}
+		case ':':
+			value, err := strconv.ParseInt(string(line[1:]), 10, 64)
+			if err != nil {
+				protocolError(ch, "illegal number "+string(line[1:]))
+				continue
+			}
+			ch <- &Payload{
+				Data: protocol.MakeIntReply(value),
+			}
+		case '$':
+			err = parseBulkString(line, reader, ch)
+			if err != nil {
+				ch <- &Payload{Err: err}
+				close(ch)
+				return
+			}
+		case '*':
+			err = parseArray(line, reader, ch)
+			if err != nil {
+				ch <- &Payload{Err: err}
+				close(ch)
+				return
+			}
+		default:
+			args := bytes.Split(line, []byte{' '})
+			ch <- &Payload{
+				Data: protocol.MakeMultiBulkReply(args),
+			}
 		}
 	}
-	//Allocate memory
-	buf.Grow(bufLen)
-	//Write string step by step,avoid concat strings
-	buf.WriteString("*")
-	buf.WriteString(strconv.Itoa(argLen))
-	buf.WriteString(CRLF)
-	for _, arg := range r.Args {
-		if arg == nil {
-			buf.WriteString("$-1")
-			buf.WriteString(CRLF)
-		} else {
-			buf.WriteString("$")
-			buf.WriteString(strconv.Itoa(len(arg)))
-			buf.WriteString(CRLF)
-			//Write bytes,avoid slice of byte to string(slicebytetostring)
-			buf.Write(arg)
-			buf.WriteString(CRLF)
+}
+
+func parseBulkString(header []byte, reader *bufio.Reader, ch chan<- *Payload) error {
+	strLen, err := strconv.ParseInt(string(header[1:]), 10, 64)
+	if err != nil || strLen < -1 {
+		protocolError(ch, "illegal bulk string header: "+string(header))
+		return nil
+	} else if strLen == -1 {
+		ch <- &Payload{
+			Data: protocol.MakeNullBulkReply(),
 		}
-	}
-	return buf.Bytes()
-}
-
-/* ---- Multi Raw Reply ---- */
-
-// MultiRawReply store complex list structure, for example GeoPos command
-type MultiRawReply struct {
-	Replies []redis.Reply
-}
-
-// MakeMultiRawReply creates MultiRawReply
-func MakeMultiRawReply(replies []redis.Reply) *MultiRawReply {
-	return &MultiRawReply{
-		Replies: replies,
-	}
-}
-
-// ToBytes marshal redis.Reply
-func (r *MultiRawReply) ToBytes() []byte {
-	argLen := len(r.Replies)
-	var buf bytes.Buffer
-	buf.WriteString("*" + strconv.Itoa(argLen) + CRLF)
-	for _, arg := range r.Replies {
-		buf.Write(arg.ToBytes())
-	}
-	return buf.Bytes()
-}
-
-/* ---- Status Reply ---- */
-
-// StatusReply stores a simple status string
-type StatusReply struct {
-	Status string
-}
-
-// MakeStatusReply creates StatusReply
-func MakeStatusReply(status string) *StatusReply {
-	return &StatusReply{
-		Status: status,
-	}
-}
-
-// ToBytes marshal redis.Reply
-func (r *StatusReply) ToBytes() []byte {
-	return []byte("+" + r.Status + CRLF)
-}
-
-// IsOKReply returns true if the given protocol is +OK
-func IsOKReply(reply redis.Reply) bool {
-	return string(reply.ToBytes()) == "+OK\r\n"
-}
-
-/* ---- Int Reply ---- */
-
-// IntReply stores an int64 number
-type IntReply struct {
-	Code int64
-}
-
-// MakeIntReply creates int protocol
-func MakeIntReply(code int64) *IntReply {
-	return &IntReply{
-		Code: code,
-	}
-}
-
-// ToBytes marshal redis.Reply
-func (r *IntReply) ToBytes() []byte {
-	return []byte(":" + strconv.FormatInt(r.Code, 10) + CRLF)
-}
-
-/* ---- Error Reply ---- */
-
-// ErrorReply is an error and redis.Reply
-type ErrorReply interface {
-	Error() string
-	ToBytes() []byte
-}
-
-// StandardErrReply represents server error
-type StandardErrReply struct {
-	Status string
-}
-
-// MakeErrReply creates StandardErrReply
-func MakeErrReply(status string) *StandardErrReply {
-	return &StandardErrReply{
-		Status: status,
-	}
-}
-
-// IsErrorReply returns true if the given protocol is error
-func IsErrorReply(reply redis.Reply) bool {
-	return reply.ToBytes()[0] == '-'
-}
-
-func Try2ErrorReply(reply redis.Reply) error {
-	str := string(reply.ToBytes())
-	if len(str) == 0 {
-		return errors.New("empty reply")
-	}
-	if str[0] != '-' {
 		return nil
 	}
-	return errors.New(str[1:])
+	body := make([]byte, strLen+2)
+	_, err = io.ReadFull(reader, body)
+	if err != nil {
+		return err
+	}
+	ch <- &Payload{
+		Data: protocol.MakeBulkReply(body[:len(body)-2]),
+	}
+	return nil
 }
 
-// ToBytes marshal redis.Reply
-func (r *StandardErrReply) ToBytes() []byte {
-	return []byte("-" + r.Status + CRLF)
+// there is no CRLF between RDB and following AOF, therefore it needs to be treated differently
+func parseRDBBulkString(reader *bufio.Reader, ch chan<- *Payload) error {
+	header, err := reader.ReadBytes('\n')
+	if err != nil {
+		return errors.New("failed to read bytes")
+	}
+	header = bytes.TrimSuffix(header, []byte{'\r', '\n'})
+	if len(header) == 0 {
+		return errors.New("empty header")
+	}
+	strLen, err := strconv.ParseInt(string(header[1:]), 10, 64)
+	if err != nil || strLen <= 0 {
+		return errors.New("illegal bulk header: " + string(header))
+	}
+	body := make([]byte, strLen)
+	_, err = io.ReadFull(reader, body)
+	if err != nil {
+		return err
+	}
+	ch <- &Payload{
+		Data: protocol.MakeBulkReply(body[:len(body)]),
+	}
+	return nil
 }
 
-func (r *StandardErrReply) Error() string {
-	return r.Status
+func parseArray(header []byte, reader *bufio.Reader, ch chan<- *Payload) error {
+	nStrs, err := strconv.ParseInt(string(header[1:]), 10, 64)
+	if err != nil || nStrs < 0 {
+		protocolError(ch, "illegal array header "+string(header[1:]))
+		return nil
+	} else if nStrs == 0 {
+		ch <- &Payload{
+			Data: protocol.MakeEmptyMultiBulkReply(),
+		}
+		return nil
+	}
+	lines := make([][]byte, 0, nStrs)
+	for i := int64(0); i < nStrs; i++ {
+		var line []byte
+		line, err = reader.ReadBytes('\n')
+		if err != nil {
+			return err
+		}
+		length := len(line)
+		if length < 4 || line[length-2] != '\r' || line[0] != '$' {
+			protocolError(ch, "illegal bulk string header "+string(line))
+			break
+		}
+		strLen, err := strconv.ParseInt(string(line[1:length-2]), 10, 64)
+		if err != nil || strLen < -1 {
+			protocolError(ch, "illegal bulk string length "+string(line))
+			break
+		} else if strLen == -1 {
+			lines = append(lines, []byte{})
+		} else {
+			body := make([]byte, strLen+2)
+			_, err := io.ReadFull(reader, body)
+			if err != nil {
+				return err
+			}
+			lines = append(lines, body[:len(body)-2])
+		}
+	}
+	ch <- &Payload{
+		Data: protocol.MakeMultiBulkReply(lines),
+	}
+	return nil
+}
+
+func protocolError(ch chan<- *Payload, msg string) {
+	err := errors.New("protocol error: " + msg)
+	ch <- &Payload{Err: err}
 }
