@@ -68,36 +68,12 @@ func makeBasicDB() *DB {
 	return db
 }
 
-// func (db *DB) Exec(c redis.Connection, cmdLine [][]byte) redis.Reply {
-// 	// transaction control commands and other commands which cannot execute within transaction
-// 	cmdName := strings.ToLower(string(cmdLine[0]))
-// 	if cmdName == "multi" {
-// 		if len(cmdLine) != 1 {
-// 			return protocol.MakeArgNumErrReply(cmdName)
-// 		}
-// 		return StartMulti(c)
-// 	} else if cmdName == "discard" {
-// 		if len(cmdLine) != 1 {
-// 			return protocol.MakeArgNumErrReply(cmdName)
-// 		}
-// 		return DiscardMulti(c)
-// 	} else if cmdName == "exec" {
-// 		if len(cmdLine) != 1 {
-// 			return protocol.MakeArgNumErrReply(cmdName)
-// 		}
-// 		return execMulti(db, c)
-// 	} else if cmdName == "watch" {
-// 		if !validateArity(-2, cmdLine) {
-// 			return protocol.MakeArgNumErrReply(cmdName)
-// 		}
-// 		return Watch(db, c, cmdLine[1:])
-// 	}
-// 	if c != nil && c.InMultiState() {
-// 		return EnqueueCmd(c, cmdLine)
-// 	}
-
-// 	return db.execNormalCommand(cmdLine)
-// }
+func (db *DB) Exec(c redis.Connection, cmdLine [][]byte) redis.Reply {
+	if len(cmdLine) == 0 {
+		return protocol.MakeErrReply("ERR empty command")
+	}
+	return db.execNormalCommand(cmdLine)
+}
 
 func (db *DB) execNormalCommand(cmdLine [][]byte) redis.Reply {
 	cmdName := strings.ToLower(string(cmdLine[0]))
