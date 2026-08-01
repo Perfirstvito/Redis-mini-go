@@ -18,6 +18,7 @@ import (
 type Payload struct {
 	Data redis.Reply
 	Err  error
+	Size int
 }
 
 // ParseStream reads data from io.Reader and send payloads through channel
@@ -86,6 +87,7 @@ func parse0(rawReader io.Reader, ch chan<- *Payload) {
 			content := string(line[1:])
 			ch <- &Payload{
 				Data: protocol.MakeStatusReply(content),
+				Size: length,
 			}
 			if strings.HasPrefix(content, "FULLRESYNC") {
 				err = parseRDBBulkString(reader, ch)
@@ -98,6 +100,7 @@ func parse0(rawReader io.Reader, ch chan<- *Payload) {
 		case '-':
 			ch <- &Payload{
 				Data: protocol.MakeErrReply(string(line[1:])),
+				Size: length,
 			}
 		case ':':
 			value, err := strconv.ParseInt(string(line[1:]), 10, 64)
@@ -107,6 +110,7 @@ func parse0(rawReader io.Reader, ch chan<- *Payload) {
 			}
 			ch <- &Payload{
 				Data: protocol.MakeIntReply(value),
+				Size: length,
 			}
 		case '$':
 			err = parseBulkString(line, reader, ch)
@@ -126,12 +130,14 @@ func parse0(rawReader io.Reader, ch chan<- *Payload) {
 			args := bytes.Split(line, []byte{' '})
 			ch <- &Payload{
 				Data: protocol.MakeMultiBulkReply(args),
+				Size: length,
 			}
 		}
 	}
 }
 
 func parseBulkString(header []byte, reader *bufio.Reader, ch chan<- *Payload) error {
+	size := len(header) + 2
 	strLen, err := strconv.ParseInt(string(header[1:]), 10, 64)
 	if err != nil || strLen < -1 {
 		protocolError(ch, "illegal bulk string header: "+string(header))
@@ -139,6 +145,7 @@ func parseBulkString(header []byte, reader *bufio.Reader, ch chan<- *Payload) er
 	} else if strLen == -1 {
 		ch <- &Payload{
 			Data: protocol.MakeNullBulkReply(),
+			Size: size,
 		}
 		return nil
 	}
@@ -149,6 +156,7 @@ func parseBulkString(header []byte, reader *bufio.Reader, ch chan<- *Payload) er
 	}
 	ch <- &Payload{
 		Data: protocol.MakeBulkReply(body[:len(body)-2]),
+		Size: size + len(body),
 	}
 	return nil
 }
@@ -159,6 +167,7 @@ func parseRDBBulkString(reader *bufio.Reader, ch chan<- *Payload) error {
 	if err != nil {
 		return errors.New("failed to read bytes")
 	}
+	size := len(header)
 	header = bytes.TrimSuffix(header, []byte{'\r', '\n'})
 	if len(header) == 0 {
 		return errors.New("empty header")
@@ -174,11 +183,13 @@ func parseRDBBulkString(reader *bufio.Reader, ch chan<- *Payload) error {
 	}
 	ch <- &Payload{
 		Data: protocol.MakeBulkReply(body[:len(body)]),
+		Size: size + len(body),
 	}
 	return nil
 }
 
 func parseArray(header []byte, reader *bufio.Reader, ch chan<- *Payload) error {
+	size := len(header) + 2
 	nStrs, err := strconv.ParseInt(string(header[1:]), 10, 64)
 	if err != nil || nStrs < 0 {
 		protocolError(ch, "illegal array header "+string(header[1:]))
@@ -186,6 +197,7 @@ func parseArray(header []byte, reader *bufio.Reader, ch chan<- *Payload) error {
 	} else if nStrs == 0 {
 		ch <- &Payload{
 			Data: protocol.MakeEmptyMultiBulkReply(),
+			Size: size,
 		}
 		return nil
 	}
@@ -196,6 +208,7 @@ func parseArray(header []byte, reader *bufio.Reader, ch chan<- *Payload) error {
 		if err != nil {
 			return err
 		}
+		size += len(line)
 		length := len(line)
 		if length < 4 || line[length-2] != '\r' || line[0] != '$' {
 			protocolError(ch, "illegal bulk string header "+string(line))
@@ -213,11 +226,13 @@ func parseArray(header []byte, reader *bufio.Reader, ch chan<- *Payload) error {
 			if err != nil {
 				return err
 			}
+			size += len(body)
 			lines = append(lines, body[:len(body)-2])
 		}
 	}
 	ch <- &Payload{
 		Data: protocol.MakeMultiBulkReply(lines),
+		Size: size,
 	}
 	return nil
 }
