@@ -41,6 +41,10 @@ var connPool = sync.Pool{
 	},
 }
 
+func (c *Connection) RemoteAddr() string {
+	return c.conn.RemoteAddr().String()
+}
+
 // 关闭函数 所有状态归零
 func (c *Connection) Close() error {
 	c.sendingData.WaitWithTimeout(10 * time.Second)
