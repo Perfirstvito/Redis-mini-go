@@ -9,13 +9,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	// "my-redis/aof"
+	"my-redis/aof"
 	"my-redis/config"
 	"my-redis/interfaces/database"
 	"my-redis/interfaces/redis"
 	"my-redis/lib/logger"
 	"my-redis/lib/utils"
-
 	"my-redis/pubsub"
 	"my-redis/redis/protocol"
 )
