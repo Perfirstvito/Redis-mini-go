@@ -47,6 +47,8 @@ func TestServerExecRejectsWritesOnReadOnlySlave(t *testing.T) {
 
 	assertServerReply(t, server.Exec(client, serverCmdLine("get", "key")), "$3\r\nold\r\n")
 	assertServerReply(t, server.Exec(client, serverCmdLine("set", "key", "new")), "-READONLY You can't write against a read only slave.\r\n")
+	assertServerReply(t, server.Exec(client, serverCmdLine("rename", "key", "renamed")), "-READONLY You can't write against a read only slave.\r\n")
+	assertServerReply(t, server.Exec(client, serverCmdLine("renamenx", "key", "renamed")), "-READONLY You can't write against a read only slave.\r\n")
 
 	master := connection.NewFakeConn()
 	master.SetMaster()
